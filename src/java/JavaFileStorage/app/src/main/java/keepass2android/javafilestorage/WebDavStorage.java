@@ -171,8 +171,9 @@ public class WebDavStorage extends JavaFileStorageBase {
         }
     }
 
-    //client to be reused (connection pool/thread pool). We're building a custom client for each ConnectionInfo in getClient for actual usage
+    // Reuse the connection pool/thread pool and authentication cache across WebDAV calls.
     final OkHttpClient baseClient = new OkHttpClient();
+    private final Map<String, CachingAuthenticator> authCache = new ConcurrentHashMap<>();
 
     private OkHttpClient getClient(ConnectionInfo ci) throws NoSuchAlgorithmException, KeyManagementException, KeyStoreException, IOException {
 
@@ -183,7 +184,6 @@ public class WebDavStorage extends JavaFileStorageBase {
 
 
         OkHttpClient.Builder builder = baseClient.newBuilder();
-        final Map<String, CachingAuthenticator> authCache = new ConcurrentHashMap<>();
 
         com.burgstaller.okhttp.digest.Credentials credentials = new com.burgstaller.okhttp.digest.Credentials(ci.username, ci.password);
         final BasicAuthenticator basicAuthenticator = new BasicAuthenticator(credentials);
@@ -197,6 +197,14 @@ public class WebDavStorage extends JavaFileStorageBase {
 
         builder = builder.authenticator(new CachingAuthenticatorDecorator(authenticator, authCache))
                 .addInterceptor(new AuthenticationCacheInterceptor(authCache));
+
+        // OkHttp defaults to 10-second read/write/connect timeouts. A ~33 MB KDBX can
+        // legitimately take longer over WebDAV, so set explicit timeouts regardless
+        // of certificate-validation mode.
+        builder.connectTimeout(30, TimeUnit.SECONDS);
+        builder.readTimeout(120, TimeUnit.SECONDS);
+        builder.writeTimeout(120, TimeUnit.SECONDS);
+
         if ((mCertificateErrorHandler != null) && (!mCertificateErrorHandler.alwaysFailOnValidationError())) {
 
 
@@ -219,9 +227,6 @@ public class WebDavStorage extends JavaFileStorageBase {
                              .hostnameVerifier(new DecoratedHostnameVerifier(OkHostnameVerifier.INSTANCE, mCertificateErrorHandler));
 
 
-            builder.connectTimeout(25, TimeUnit.SECONDS);
-            builder.readTimeout(25, TimeUnit.SECONDS);
-            builder.writeTimeout(25, TimeUnit.SECONDS);
         }
 
 
