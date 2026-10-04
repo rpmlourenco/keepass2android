@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - fix/webdav-preemptive-basic-auth
   pull_request:
 
 jobs:
@@ -328,7 +329,6 @@ jobs:
         make dotnetbuild Flavor=Net          
 
     - name: Build APK (net)
-      if: github.ref == 'refs/heads/main'
       env:
         DropboxAppKey: ${{ secrets.DROPBOX_APP_KEY }}
         DropboxAppSecret: ${{ secrets.DROPBOX_APP_SECRET }}
