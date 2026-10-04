@@ -449,7 +449,7 @@ Muito útil se existirem muitos resultados iguais.</string>
   <string name="filestoragename_androidsend">Enviar para aplicações de terceiros</string>
   <string name="filestoragename_ftp">FTP</string>
   <string name="filestoragename_http">HTTP (WebDav)</string>
-  <string name="filestoragename_https">HTTP (WebDav)</string>
+  <string name="filestoragename_https">HTTPS (WebDav)</string>
   <string name="filestoragename_owncloud">OwnCloud</string>
   <string name="filestoragename_dropbox">Dropbox</string>
   <string name="filestoragename_dropboxKP2A">Dropbox (pasta KP2A)</string>
