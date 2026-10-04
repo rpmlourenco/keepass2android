@@ -448,13 +448,22 @@ public class WebDavStorage extends JavaFileStorageBase {
                 requestBody = RequestBody.create(data, MediaType.parse("application/binary"));
             }
 
-            Request request = new Request.Builder()
+            Request.Builder requestBuilder = new Request.Builder()
                     .url(new URL(ci.URL))
-                    .put(requestBody)
-                    .build();
+                    .put(requestBody);
 
-            Response response = getClient(ci).newCall(request).execute();
-            checkStatus(response);
+            // FileBrowser Quantum (and many WebDAV servers) uses HTTP Basic auth.
+            // Send credentials preemptively over HTTPS so a large PUT is not first
+            // attempted unauthenticated and then repeated after a 401 challenge.
+            if (ci.URL.startsWith("https://") && ci.username != null && ci.password != null) {
+                requestBuilder.header("Authorization", okhttp3.Credentials.basic(ci.username, ci.password));
+            }
+
+            Request request = requestBuilder.build();
+
+            try (Response response = getClient(ci).newCall(request).execute()) {
+                checkStatus(response);
+            }
         } catch (Exception e) {
             throw convertException(e);
         }
