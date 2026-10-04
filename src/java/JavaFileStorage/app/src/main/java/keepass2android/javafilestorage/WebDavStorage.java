@@ -144,14 +144,23 @@ public class WebDavStorage extends JavaFileStorageBase {
     }
 
 
+    private Request.Builder addPreemptiveBasicAuth(Request.Builder builder, ConnectionInfo ci) {
+        // Avoid the initial 401 challenge for HTTPS WebDAV servers using HTTP Basic auth.
+        // Never send credentials preemptively over cleartext HTTP.
+        if (ci.URL.startsWith("https://") && ci.username != null && ci.password != null) {
+            builder.header("Authorization", okhttp3.Credentials.basic(ci.username, ci.password));
+        }
+        return builder;
+    }
+
     @Override
     public InputStream openFileForRead(String path) throws Exception {
         try {
             ConnectionInfo ci = splitStringToConnectionInfo(path);
 
-            Request request = new Request.Builder()
+            Request request = addPreemptiveBasicAuth(new Request.Builder()
                     .url(new URL(ci.URL))
-                    .method("GET", null)
+                    .method("GET", null), ci)
                     .build();
 
             Response response = getClient(ci).newCall(request).execute();
@@ -162,8 +171,9 @@ public class WebDavStorage extends JavaFileStorageBase {
         }
     }
 
-    //client to be reused (connection pool/thread pool). We're building a custom client for each ConnectionInfo in getClient for actual usage
+    // Reuse the connection pool/thread pool and authentication cache across WebDAV calls.
     final OkHttpClient baseClient = new OkHttpClient();
+    private final Map<String, CachingAuthenticator> authCache = new ConcurrentHashMap<>();
 
     private OkHttpClient getClient(ConnectionInfo ci) throws NoSuchAlgorithmException, KeyManagementException, KeyStoreException, IOException {
 
@@ -174,7 +184,6 @@ public class WebDavStorage extends JavaFileStorageBase {
 
 
         OkHttpClient.Builder builder = baseClient.newBuilder();
-        final Map<String, CachingAuthenticator> authCache = new ConcurrentHashMap<>();
 
         com.burgstaller.okhttp.digest.Credentials credentials = new com.burgstaller.okhttp.digest.Credentials(ci.username, ci.password);
         final BasicAuthenticator basicAuthenticator = new BasicAuthenticator(credentials);
@@ -188,6 +197,14 @@ public class WebDavStorage extends JavaFileStorageBase {
 
         builder = builder.authenticator(new CachingAuthenticatorDecorator(authenticator, authCache))
                 .addInterceptor(new AuthenticationCacheInterceptor(authCache));
+
+        // OkHttp defaults to 10-second read/write/connect timeouts. A ~33 MB KDBX can
+        // legitimately take longer over WebDAV, so set explicit timeouts regardless
+        // of certificate-validation mode.
+        builder.connectTimeout(30, TimeUnit.SECONDS);
+        builder.readTimeout(120, TimeUnit.SECONDS);
+        builder.writeTimeout(120, TimeUnit.SECONDS);
+
         if ((mCertificateErrorHandler != null) && (!mCertificateErrorHandler.alwaysFailOnValidationError())) {
 
 
@@ -210,9 +227,6 @@ public class WebDavStorage extends JavaFileStorageBase {
                              .hostnameVerifier(new DecoratedHostnameVerifier(OkHostnameVerifier.INSTANCE, mCertificateErrorHandler));
 
 
-            builder.connectTimeout(25, TimeUnit.SECONDS);
-            builder.readTimeout(25, TimeUnit.SECONDS);
-            builder.writeTimeout(25, TimeUnit.SECONDS);
         }
 
 
@@ -227,10 +241,10 @@ public class WebDavStorage extends JavaFileStorageBase {
         ConnectionInfo sourceCi = splitStringToConnectionInfo(sourcePath);
         ConnectionInfo destinationCi = splitStringToConnectionInfo(destinationPath);
 
-        Request.Builder requestBuilder = new Request.Builder()
+        Request.Builder requestBuilder = addPreemptiveBasicAuth(new Request.Builder()
                 .url(new URL(sourceCi.URL))
                 .method("MOVE", null) // "MOVE" is the HTTP method
-                .header("Destination", destinationCi.URL); // New URI for the resource
+                .header("Destination", destinationCi.URL), sourceCi); // New URI for the resource
 
         // Use delete-then-move strategy to avoid HTTP 409 conflicts
         if (overwrite) {
@@ -253,45 +267,37 @@ public class WebDavStorage extends JavaFileStorageBase {
 
         Request request = requestBuilder.build();
 
-        Response response = getClient(sourceCi).newCall(request).execute();
-
-        // Check the status code
-        if (response.isSuccessful()) {
-            // WebDAV MOVE can return 201 (Created) if a new resource was created at dest,
-            // or 204 (No Content) if moved to a pre-existing destination (e.g., just renamed).
-            // A 200 OK might also be returned by some servers, though 201/204 are more common.
-
-        }
-        else
-        {
-            int statusCode = response.code();
-            String errorMessage = "Rename/Move failed for " + sourceCi.URL + " to " + destinationCi.URL + ": " + statusCode + " " + response.message();
-
-            // If we get a 409 conflict and overwrite is true, try retry with enhanced cleanup
-            if (overwrite && statusCode == 409) {
-                try {
-                    response.close();
-                    // Force delete destination and retry
-                    deleteFileIfExists(destinationCi);
-                    // Small delay to ensure server processes the deletion
-                    Thread.sleep(100);
-
-                    // Retry the MOVE operation
-                    Response retryResponse = getClient(sourceCi).newCall(request).execute();
-                    if (retryResponse.isSuccessful()) {
-                        retryResponse.close();
-                        return; // Success on retry
-                    } else {
-                        errorMessage = "Rename/Move failed even after retry for " + sourceCi.URL + " to " + destinationCi.URL + ": " + retryResponse.code() + " " + retryResponse.message();
-                        retryResponse.close();
-                    }
-                } catch (Exception retryException) {
-                    errorMessage = "Rename/Move failed and retry attempt also failed: " + errorMessage + " (Retry error: " + retryException.getMessage() + ")";
-                }
+        String errorMessage = null;
+        int statusCode;
+        try (Response response = getClient(sourceCi).newCall(request).execute()) {
+            if (response.isSuccessful()) {
+                return;
             }
-
-            throw new Exception(errorMessage);
+            statusCode = response.code();
+            errorMessage = "Rename/Move failed for " + sourceCi.URL + " to " + destinationCi.URL + ": " + statusCode + " " + response.message();
         }
+
+        // If we get a 409 conflict and overwrite is true, try retry with enhanced cleanup
+        if (overwrite && statusCode == 409) {
+            try {
+                // Force delete destination and retry
+                deleteFileIfExists(destinationCi);
+                // Small delay to ensure server processes the deletion
+                Thread.sleep(100);
+
+                // Retry the MOVE operation
+                try (Response retryResponse = getClient(sourceCi).newCall(request).execute()) {
+                    if (retryResponse.isSuccessful()) {
+                        return; // Success on retry
+                    }
+                    errorMessage = "Rename/Move failed even after retry for " + sourceCi.URL + " to " + destinationCi.URL + ": " + retryResponse.code() + " " + retryResponse.message();
+                }
+            } catch (Exception retryException) {
+                errorMessage = "Rename/Move failed and retry attempt also failed: " + errorMessage + " (Retry error: " + retryException.getMessage() + ")";
+            }
+        }
+
+        throw new Exception(errorMessage);
     }
 
     /**
@@ -303,9 +309,9 @@ public class WebDavStorage extends JavaFileStorageBase {
             // First check if file exists using PROPFIND
             if (fileExists(ci)) {
                 // File exists, proceed with deletion
-                Request request = new Request.Builder()
+                Request request = addPreemptiveBasicAuth(new Request.Builder()
                         .url(new URL(ci.URL))
-                        .delete()
+                        .delete(), ci)
                         .build();
                 Response response = getClient(ci).newCall(request).execute();
                 try {
@@ -328,7 +334,7 @@ public class WebDavStorage extends JavaFileStorageBase {
      */
     private boolean fileExists(ConnectionInfo ci) throws Exception {
         try {
-            Request request = new Request.Builder()
+            Request request = addPreemptiveBasicAuth(new Request.Builder()
                     .url(new URL(ci.URL))
                     .method("PROPFIND", RequestBody.create(MediaType.parse("application/xml"),
                             "<?xml version=\"1.0\" encoding=\"utf-8\" ?>\n" +
@@ -338,7 +344,7 @@ public class WebDavStorage extends JavaFileStorageBase {
                             "    </D:prop>\n" +
                             "</D:propfind>"))
                     .header("Depth", "0")
-                    .header("Content-Type", "application/xml")
+                    .header("Content-Type", "application/xml"), ci)
                     .build();
 
             Response response = getClient(ci).newCall(request).execute();
@@ -448,13 +454,14 @@ public class WebDavStorage extends JavaFileStorageBase {
                 requestBody = RequestBody.create(data, MediaType.parse("application/binary"));
             }
 
-            Request request = new Request.Builder()
+            Request request = addPreemptiveBasicAuth(new Request.Builder()
                     .url(new URL(ci.URL))
-                    .put(requestBody)
+                    .put(requestBody), ci)
                     .build();
 
-            Response response = getClient(ci).newCall(request).execute();
-            checkStatus(response);
+            try (Response response = getClient(ci).newCall(request).execute()) {
+                checkStatus(response);
+            }
         } catch (Exception e) {
             throw convertException(e);
         }
@@ -469,13 +476,14 @@ public class WebDavStorage extends JavaFileStorageBase {
             String newFolder = createFilePath(parentPath, newDirName);
             ConnectionInfo ci = splitStringToConnectionInfo(newFolder);
 
-            Request request = new Request.Builder()
+            Request request = addPreemptiveBasicAuth(new Request.Builder()
                     .url(new URL(ci.URL))
-                    .method("MKCOL", null)
+                    .method("MKCOL", null), ci)
                     .build();
 
-            Response response = getClient(ci).newCall(request).execute();
-            checkStatus(response);
+            try (Response response = getClient(ci).newCall(request).execute()) {
+                checkStatus(response);
+            }
             return newFolder;
         } catch (Exception e) {
             throw convertException(e);
@@ -512,18 +520,17 @@ public class WebDavStorage extends JavaFileStorageBase {
                     " <d:prop><d:displayname/><d:getlastmodified/><d:getcontentlength/></d:prop>\n" +
                     "</d:propfind>\n";
             Log.d("WEBDAV", "starting query for " + ci.URL);
-            Request request = new Request.Builder()
+            Request request = addPreemptiveBasicAuth(new Request.Builder()
                     .url(new URL(ci.URL))
                     .method("PROPFIND", RequestBody.create(MediaType.parse("application/xml"),requestBody))
-                    .addHeader("Depth",String.valueOf(depth))
-
+                    .addHeader("Depth",String.valueOf(depth)), ci)
                     .build();
 
-            Response response = getClient(ci).newCall(request).execute();
-
-            checkStatus(response);
-
-            String xml = response.body().string();
+            String xml;
+            try (Response response = getClient(ci).newCall(request).execute()) {
+                checkStatus(response);
+                xml = response.body().string();
+            }
 
             PropfindXmlParser parser = new PropfindXmlParser();
             List<PropfindXmlParser.Response> responses = parser.parse(new StringReader(xml));
@@ -650,14 +657,14 @@ public class WebDavStorage extends JavaFileStorageBase {
         try {
             ConnectionInfo ci = splitStringToConnectionInfo(path);
 
-            Request request = new Request.Builder()
+            Request request = addPreemptiveBasicAuth(new Request.Builder()
                     .url(new URL(ci.URL))
-                    .delete()
+                    .delete(), ci)
                     .build();
 
-            Response response = getClient(ci).newCall(request).execute();
-
-            checkStatus(response);
+            try (Response response = getClient(ci).newCall(request).execute()) {
+                checkStatus(response);
+            }
         } catch (Exception e) {
             throw convertException(e);
         }
